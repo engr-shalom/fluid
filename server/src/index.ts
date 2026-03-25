@@ -40,7 +40,7 @@ const corsOptions = {
     }
 
     // Check if the origin is in the allowed list
-    if (config.allowedOrigins.includes(origin)) {
+    if (config.allowedOrigins.includes("*") || config.allowedOrigins.includes(origin)) {
       callback(null, true);
       return;
     }
@@ -80,7 +80,7 @@ app.post(
   apiKeyRateLimit,
   limiter,
   (req: Request, res: Response, next: NextFunction) => {
-    feeBumpHandler(req, res, config, next);
+    feeBumpHandler(req, res, next, config);
   },
 );
 
