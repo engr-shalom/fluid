@@ -7,6 +7,7 @@ interface FluidClientConfig {
   serverUrl: string;
   networkPassphrase: string;
   horizonUrl?: string;
+  useWorker?: boolean; // New option to enable Web Worker for signing operations
 }
 
 interface FeeBumpResponse {
@@ -15,23 +16,155 @@ interface FeeBumpResponse {
   hash?: string;
 }
 
+// Worker message types
+interface WorkerRequest {
+  id: string;
+  type: "sign_transaction" | "create_xdr";
+  data: any;
+}
+
+interface WorkerResponse {
+  id: string;
+  type: "success" | "error";
+  result?: any;
+  error?: string;
+}
+
 export class FluidClient {
   private serverUrl: string;
   private networkPassphrase: string;
   private horizonServer?: any;
+  private useWorker: boolean;
+  private worker?: Worker;
+  private pendingRequests: Map<
+    string,
+    { resolve: Function; reject: Function; timeout: number }
+  > = new Map();
+  private requestIdCounter: number = 0;
 
   constructor(config: FluidClientConfig) {
     this.serverUrl = config.serverUrl;
     this.networkPassphrase = config.networkPassphrase;
+    this.useWorker = config.useWorker || false;
+
     if (config.horizonUrl) {
       this.horizonServer = new StellarSdk.Horizon.Server(config.horizonUrl);
     }
+
+    // Initialize worker if enabled
+    if (this.useWorker && typeof Worker !== "undefined") {
+      this.initializeWorker();
+    }
   }
 
-  
+  private initializeWorker(): void {
+    try {
+      // Create worker from the worker file
+      this.worker = new Worker(
+        new URL("./workers/signingWorker.ts", import.meta.url),
+        {
+          type: "module",
+        },
+      );
+
+      this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
+        const { id, type, result, error } = event.data;
+        const pending = this.pendingRequests.get(id);
+
+        if (pending) {
+          clearTimeout(pending.timeout);
+          this.pendingRequests.delete(id);
+
+          if (type === "success") {
+            pending.resolve(result);
+          } else {
+            pending.reject(new Error(error || "Worker operation failed"));
+          }
+        }
+      };
+
+      this.worker.onerror = (error) => {
+        console.error("[FluidClient] Worker error:", error);
+        // Fallback to main thread on worker error
+        this.useWorker = false;
+        this.worker?.terminate();
+        this.worker = undefined;
+      };
+
+      console.log(
+        "[FluidClient] Web Worker initialized for signing operations",
+      );
+    } catch (error) {
+      console.warn(
+        "[FluidClient] Failed to initialize worker, falling back to main thread:",
+        error,
+      );
+      this.useWorker = false;
+    }
+  }
+
+  private async sendWorkerMessage(
+    type: "sign_transaction" | "create_xdr",
+    data: any,
+    timeout: number = 30000,
+  ): Promise<any> {
+    if (!this.worker || !this.useWorker) {
+      throw new Error("Worker not available");
+    }
+
+    const id = `req_${++this.requestIdCounter}`;
+
+    return new Promise((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        this.pendingRequests.delete(id);
+        reject(new Error("Worker operation timed out"));
+      }, timeout);
+
+      this.pendingRequests.set(id, { resolve, reject, timeout: timeoutId });
+
+      const request: WorkerRequest = { id, type, data };
+      this.worker!.postMessage(request);
+    });
+  }
+
+  // Worker-based signing method
+  private async signWithWorker(transaction: any): Promise<string> {
+    try {
+      // Extract transaction data for worker
+      const transactionData = {
+        transactionXdr: transaction.toXDR(),
+        // Note: In a real implementation, you'd need to handle key extraction securely
+        // This is a simplified example
+        secretKey: "mock_key_for_demo", // This would need proper secure handling
+      };
+
+      const result = await this.sendWorkerMessage(
+        "sign_transaction",
+        transactionData,
+      );
+      return result.signedXdr;
+    } catch (error) {
+      console.error(
+        "[FluidClient] Worker signing failed, falling back to main thread:",
+        error,
+      );
+      throw error;
+    }
+  }
+
+  // Main thread signing fallback
+  private async signOnMainThread(
+    transaction: any,
+    keypair: any,
+  ): Promise<string> {
+    // Use existing Stellar SDK signing
+    transaction.sign(keypair);
+    return transaction.toXDR();
+  }
+
   async requestFeeBump(
     signedTransactionXdr: string,
-    submit: boolean = false
+    submit: boolean = false,
   ): Promise<FeeBumpResponse> {
     const response = await fetch(`${this.serverUrl}/fee-bump`, {
       method: "POST",
@@ -57,7 +190,6 @@ export class FluidClient {
     };
   }
 
-  
   async submitFeeBumpTransaction(feeBumpXdr: string): Promise<any> {
     if (!this.horizonServer) {
       throw new Error("Horizon URL not configured");
@@ -65,19 +197,86 @@ export class FluidClient {
 
     const feeBumpTx = StellarSdk.TransactionBuilder.fromXDR(
       feeBumpXdr,
-      this.networkPassphrase
+      this.networkPassphrase,
     );
 
     return await this.horizonServer.submitTransaction(feeBumpTx);
   }
 
-  
   async buildAndRequestFeeBump(
     transaction: any,
-    submit: boolean = false
+    keypair?: any,
+    submit: boolean = false,
   ): Promise<FeeBumpResponse> {
-    const signedXdr = transaction.toXDR();
+    let signedXdr: string;
+
+    if (this.useWorker && this.worker) {
+      try {
+        // Try worker-based signing
+        signedXdr = await this.signWithWorker(transaction);
+      } catch (error) {
+        console.warn(
+          "[FluidClient] Worker signing failed, using main thread fallback",
+        );
+        if (!keypair) {
+          throw new Error("Keypair required for main thread signing fallback");
+        }
+        signedXdr = await this.signOnMainThread(transaction, keypair);
+      }
+    } else {
+      // Use main thread signing
+      if (!keypair) {
+        throw new Error("Keypair required for signing");
+      }
+      signedXdr = await this.signOnMainThread(transaction, keypair);
+    }
+
     return await this.requestFeeBump(signedXdr, submit);
+  }
+
+  // New method for performance testing
+  async signMultipleTransactions(
+    transactions: any[],
+    keypair?: any,
+  ): Promise<string[]> {
+    const results: string[] = [];
+
+    for (const transaction of transactions) {
+      if (this.useWorker && this.worker) {
+        try {
+          const signedXdr = await this.signWithWorker(transaction);
+          results.push(signedXdr);
+        } catch (error) {
+          console.warn(
+            "[FluidClient] Worker signing failed, using main thread fallback",
+          );
+          if (!keypair) {
+            throw new Error(
+              "Keypair required for main thread signing fallback",
+            );
+          }
+          const signedXdr = await this.signOnMainThread(transaction, keypair);
+          results.push(signedXdr);
+        }
+      } else {
+        if (!keypair) {
+          throw new Error("Keypair required for signing");
+        }
+        const signedXdr = await this.signOnMainThread(transaction, keypair);
+        results.push(signedXdr);
+      }
+    }
+
+    return results;
+  }
+
+  // Cleanup method
+  terminate(): void {
+    if (this.worker) {
+      this.worker.terminate();
+      this.worker = undefined;
+    }
+    this.pendingRequests.clear();
   }
 }
 
@@ -94,13 +293,11 @@ async function main() {
   console.log("User wallet:", userKeypair.publicKey());
 
   // fund the wallet (onlyon testnet )
-  await fetch(
-    `https://friendbot.stellar.org?addr=${userKeypair.publicKey()}`
-  );
+  await fetch(`https://friendbot.stellar.org?addr=${userKeypair.publicKey()}`);
   await new Promise((resolve) => setTimeout(resolve, 2000));
 
   const server = new StellarSdk.Horizon.Server(
-    "https://horizon-testnet.stellar.org"
+    "https://horizon-testnet.stellar.org",
   );
   const account = await server.loadAccount(userKeypair.publicKey());
 
@@ -114,7 +311,7 @@ async function main() {
         destination: StellarSdk.Keypair.random().publicKey(),
         asset: StellarSdk.Asset.native(),
         amount: "5",
-      })
+      }),
     )
     .setTimeout(180)
     .build();
