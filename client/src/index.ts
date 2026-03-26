@@ -1,15 +1,21 @@
 import StellarSdk from "@stellar/stellar-sdk";
+import { SorobanRpc, Transaction } from "@stellar/stellar-sdk";
 import dotenv from "dotenv";
+import {
+  BuildSACTransferTxOptions,
+  buildSACTransferTx as buildSACTransferTxHelper,
+} from "./soroban";
 
 dotenv.config();
 
-interface FluidClientConfig {
+export interface FluidClientConfig {
   serverUrl: string;
   networkPassphrase: string;
   horizonUrl?: string;
+  sorobanRpcUrl?: string;
 }
 
-interface FeeBumpResponse {
+export interface FeeBumpResponse {
   xdr: string;
   status: string;
   hash?: string;
@@ -19,12 +25,16 @@ export class FluidClient {
   private serverUrl: string;
   private networkPassphrase: string;
   private horizonServer?: any;
+  private sorobanServer?: SorobanRpc.Server;
 
   constructor(config: FluidClientConfig) {
     this.serverUrl = config.serverUrl;
     this.networkPassphrase = config.networkPassphrase;
     if (config.horizonUrl) {
       this.horizonServer = new StellarSdk.Horizon.Server(config.horizonUrl);
+    }
+    if (config.sorobanRpcUrl) {
+      this.sorobanServer = new SorobanRpc.Server(config.sorobanRpcUrl);
     }
   }
 
@@ -79,7 +89,19 @@ export class FluidClient {
     const signedXdr = transaction.toXDR();
     return await this.requestFeeBump(signedXdr, submit);
   }
+
+  async buildSACTransferTx(
+    options: Omit<BuildSACTransferTxOptions, "networkPassphrase" | "sorobanServer">
+  ): Promise<Transaction> {
+    return buildSACTransferTxHelper({
+      ...options,
+      networkPassphrase: this.networkPassphrase,
+      sorobanServer: this.sorobanServer,
+    });
+  }
 }
+
+export * from "./soroban";
 
 // Example usage
 async function main() {

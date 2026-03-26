@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "ts-node src/index.ts"
+    "dev": "ts-node src/index.ts",
+    "demo:sac-transfer-xdr": "ts-node src/examples/sacTransferXdr.ts"
   },
   "keywords": [
     "stellar",
