@@ -23,8 +23,8 @@ interface FeeBumpResponse {
 export async function feeBumpHandler(
   req: Request,
   res: Response,
-  next: NextFunction,
   config: Config,
+  next: NextFunction,
 ): Promise<void> {
   try {
     const parsedBody = FeeBumpSchema.safeParse(req.body);
@@ -93,6 +93,32 @@ export async function feeBumpHandler(
       config.baseFee,
       config.feeMultiplier,
     );
+
+    // Verify settlement payment if token is specified
+    const settlementRequirement = extractSettlementRequirement(
+      body.token,
+      feeAmount,
+    );
+    if (settlementRequirement) {
+      const settlementVerification = verifySettlementPayment(
+        innerTransaction,
+        settlementRequirement,
+        config,
+      );
+
+      if (!settlementVerification.isValid) {
+        console.error(
+          `Settlement verification failed: ${settlementVerification.reason}`,
+        );
+        return next(
+          new AppError(
+            `Settlement verification failed: ${settlementVerification.reason}`,
+            400,
+            "SETTLEMENT_VERIFICATION_FAILED",
+          ),
+        );
+      }
+    }
 
     const apiKeyConfig = res.locals.apiKey as ApiKeyConfig | undefined;
     if (!apiKeyConfig) {
@@ -172,7 +198,7 @@ export async function feeBumpHandler(
     );
 
     feeBumpTx.sign(feePayerAccount.keypair);
-    recordSponsoredTransaction(tenant.id, feeAmount);
+    await recordSponsoredTransaction(tenant.id, feeAmount);
 
     const feeBumpXdr = feeBumpTx.toXDR();
     console.log(
@@ -185,11 +211,7 @@ export async function feeBumpHandler(
 
       try {
         const submissionResult = await server.submitTransaction(feeBumpTx);
-        transactionStore.addTransaction(
-          submissionResult.hash,
-          tenant.id,
-          "submitted",
-        );
+        transactionStore.addTransaction(submissionResult.hash, tenant.id, "submitted");
 
         const response: FeeBumpResponse = {
           xdr: feeBumpXdr,
